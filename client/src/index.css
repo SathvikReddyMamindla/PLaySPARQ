@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { scroll-behavior: smooth; }
+  body { background-color: #F5F1E8; color: #0F1417; }
+  ::selection { background: rgba(184, 230, 57, 0.4); color: #1A2604; }
+}
+
+/* Custom utilities for the Fuel & Pitch aesthetic */
+.glass {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(15, 20, 23, 0.06);
+}
+
+.glass-dark {
+  background: rgba(12, 17, 19, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.hover-lift {
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.hover-lift:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 14px 40px -14px rgba(15, 20, 23, 0.28);
+  border-color: rgba(18, 59, 51, 0.35);
+}
+
+.volt-glow { position: relative; overflow: hidden; }
+.volt-glow::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(184, 230, 57, 0.9), transparent);
+}
+
+.eyebrow {
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #EDE7DA; }
+::-webkit-scrollbar-thumb { background: #C9C0AC; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #B8E639; }
+
+/* ---------------------------------------------------------------------------
+   Leaflet map pins & popups (SportSphere)
+--------------------------------------------------------------------------- */
+.ath-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  box-shadow: 0 6px 16px -6px rgba(15, 20, 23, 0.5);
+  border: 2px solid #fff;
+  color: #fff;
+  font-size: 16px;
+}
+.ath-pin > span {
+  transform: rotate(45deg);
+  line-height: 1;
+}
+.ath-pin--connected {
+  background: #123B33;
+  box-shadow: 0 6px 16px -6px rgba(18, 59, 51, 0.6);
+}
+
+.leaflet-popup-content-wrapper {
+  border-radius: 16px;
+  box-shadow: 0 20px 50px -20px rgba(15, 20, 23, 0.4);
+  padding: 4px;
+}
+.leaflet-popup-content { margin: 0; }
+.ath-pop { font-family: 'Inter', sans-serif; color: #0F1417; min-width: 210px; }
+.ath-pop__head { display: flex; align-items: center; gap: 10px; }
+.ath-pop__avatar {
+  width: 42px; height: 42px; border-radius: 12px; background-size: cover;
+  background-position: center; flex-shrink: 0; background-color: #EDE7DA;
+}
+.ath-pop__head strong { display: block; font-size: 15px; line-height: 1.15; }
+.ath-pop__sub { font-size: 12px; color: #6B7280; }
+.ath-pop__score {
+  margin-left: auto; text-align: center; font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700; font-size: 20px; color: #FF6A3D;
+}
+.ath-pop__score small { display: block; font-size: 9px; color: #9CA3AF; font-weight: 500; }
+.ath-pop__meta {
+  display: flex; gap: 10px; margin: 8px 0; font-size: 11px; color: #4B5560;
+}
+.ath-pop__bio {
+  font-size: 12px; color: #4B5560; line-height: 1.4; margin: 0 0 10px;
+  max-height: 64px; overflow: hidden;
+}
+.ath-pop__btn {
+  width: 100%; padding: 8px 0; border: none; border-radius: 999px;
+  background: #FF6A3D; color: #fff; font-weight: 600; font-size: 13px; cursor: pointer;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.ath-pop__btn:hover { background: #FF7A45; transform: translateY(-1px); }
+.ath-pop__btn--done { background: #E5EAF0; color: #123B33; cursor: default; }
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
