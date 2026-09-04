@@ -15,6 +15,15 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure server/.env is loaded
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(dotenv_path=_env_path)
+else:
+    load_dotenv()
 
 MODEL = os.getenv("FEATHERLESS_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 API_BASE = os.getenv("FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1")
@@ -31,7 +40,8 @@ def get_client():
         return None
     try:
         from openai import OpenAI
-        _client = OpenAI(api_key=api_key, base_url=API_BASE)
+        base_url = os.getenv("FEATHERLESS_BASE_URL", API_BASE)
+        _client = OpenAI(api_key=api_key, base_url=base_url)
         return _client
     except Exception as e:  # pragma: no cover
         print("[ai] client init failed:", e)
@@ -125,7 +135,11 @@ def _clean_parse(data: dict, raw_text: str):
                 "role": s.get("role"),
                 "metrics": s.get("metrics") or {},
             })
-    primary = data.get("primary_sport", "").replace(" & Running", "").replace(" and Running", "")
+    primary = data.get("primary_sport", "").replace(" & Running", "").replace(" and Running", "").strip()
+    if not primary and sports:
+        primary = sports[0]["sport"]
+    if not primary:
+        primary = _detect_sport(raw_text)
     return {
         "sports": sports,
         "primary_sport": primary,
