@@ -60,7 +60,7 @@ export default function Hero({ onOpenJoinModal }) {
             </div>
 
             <motion.p initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.55 }} className="mt-6 max-w-xl text-lg text-ink-soft">
-              Athletes are scattered across disconnected apps and WhatsApp groups. SportSphere's AI reads
+              Athletes are scattered across disconnected apps and WhatsApp groups. Sparq's AI reads
               how you play, normalizes your skill across sports, and matches you with the right people and
               games near you — in plain language.
             </motion.p>

@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
-    allowedHosts: ['.e2b.app', '.localhost', 'localhost', '127.0.0.1', '0.0.0.0'],
+    allowedHosts: true,
     proxy: {
       // Browser never talks to localhost directly — the dev server proxies /api to the
       // Python backend. Supports both the sandbox preview host and local dev.

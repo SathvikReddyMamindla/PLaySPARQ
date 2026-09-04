@@ -1,62 +1,29 @@
 """
 SportSphere API — Python (FastAPI) backend.
 Ports PLAYSync's Express matchmaking engine + discovery + connections + events,
-and adds JWT auth, connection-enforced chat, personalized recommendations,
-tournament registrations with Razorpay payments & transparent fees,
-discounts, central notifications center, rich profiles, and admin capabilities.
+and adds the AI layer (Featherless) + JWT auth.
 """
 from __future__ import annotations
-import html
-import json
 import os
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
 
-from dotenv import load_dotenv
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-if _env_path.exists():
-    load_dotenv(dotenv_path=_env_path)
-else:
-    load_dotenv()
-
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import ai
 from .auth import (create_access_token, decode_token, get_current_profile,
-                    get_current_user, hash_password, verify_password)
+                   get_current_user, hash_password, verify_password)
 from .compat import (calculate_distance_km, evaluate_compatibility, match_sport_for,
                      sport_name)
-from .migrations import run_migrations
-from .payments import (calculate_pricing, create_order, generate_sandbox_signature,
-                      get_gateway_mode, validate_discount, verify_payment_signature)
-from .recommendations import (get_personalized_home_feed, get_recommended_players,
-                             get_recommended_tournaments)
-from .schemas import (AnnouncementIn, BlockUserIn, ConnectionRequestIn,
-                     ConnectionRespondIn, CreateDiscountIn, CreateOrderIn,
-                     CreateProfileIn, EventIn, LoginIn, MessageIn,
-                     NotificationPreferencesIn, ParseProfileIn, PerfSummaryIn,
-                     PrivacySettingsIn, ProfileUpdateIn, RefundIn, RegisterIn,
-                     ReportIn, TournamentIn, TournamentRegisterIn,
-                     TournamentUpdateIn, TrustNoteIn, ValidateDiscountIn,
-                     VerifyPaymentIn)
+from .schemas import (ConnectionRequestIn, ConnectionRespondIn, CreateProfileIn, EventIn,
+                      LoginIn, MatchExplanationIn, MessageIn, ParseProfileIn, PerfSummaryIn,
+                      RegisterIn, TrustNoteIn)
 from .store import SPORTS, STORE
-from .websocket import WS_MANAGER
 
+app = FastAPI(title="SportSphere API", version="0.1.0")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize SQLite schema and populate seeds on startup
-    run_migrations()
-    yield
-
-
-app = FastAPI(title="SportSphere API", version="2.0.0", lifespan=lifespan)
-
-# CORS configuration
+# CORS — allow Vite dev server, preview host, and local network IPs (for mobile devices).
 origins = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://localhost:4173",
@@ -64,47 +31,17 @@ origins = os.getenv(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in origins.split(",") if o.strip()],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Locate built frontend static files (supports local dev and containerized deployment)
-DIST_DIR: Optional[Path] = None
-for candidate in [
-    Path(__file__).resolve().parent.parent.parent / "client" / "dist",
-    Path(__file__).resolve().parent.parent / "client" / "dist",
-    Path("/app/client/dist"),
-    Path("./client/dist"),
-    Path("./dist"),
-]:
-    if candidate.exists() and (candidate / "index.html").is_file():
-        DIST_DIR = candidate
-        break
-
-if DIST_DIR and (DIST_DIR / "assets").is_dir():
-    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
-
-
-def sanitize_text(text: str) -> str:
-    return html.escape(text.strip()) if text else ""
-
-
-def require_admin(user=Depends(get_current_user)):
-    if not user.get("is_admin") and user.get("email") != "admin@sportsphere.dev":
-        raise HTTPException(status_code=403, detail="Admin permissions required")
-    return user
-
-
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "ai_enabled": ai.ai_enabled(),
-        "model": ai.MODEL,
-        "database": "sqlite_persistent",
-        "gateway": get_gateway_mode(),
-    }
+    return {"status": "ok", "ai_enabled": ai.ai_enabled(), "model": ai.MODEL,
+            "mode": "in-memory"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -118,13 +55,11 @@ def register(inp: RegisterIn, response: Response):
     user = STORE.create_user(inp.email, pwd, inp.displayName)
     profile = STORE.create_profile({
         "id": f"ath-{user['id'].split('-')[-1]}",
-        "user_id": user["id"],
         "name": inp.displayName,
         "handle": "@" + inp.displayName.lower().replace(" ", "_"),
         "primary_sport": "Football",
         "skill_level": "intermediate",
     })
-    STORE.link_user_profile(user["id"], profile["id"])
     user["profile_id"] = profile["id"]
     token = create_access_token(user["id"])
     _set_cookie(response, token)
@@ -140,15 +75,14 @@ def login(inp: LoginIn, response: Response):
     _set_cookie(response, token)
     profile_id = user.get("profile_id")
     if not profile_id or not STORE.get_profile(profile_id):
+        # Lazy-create a profile if one was never seeded.
         profile = STORE.create_profile({
             "id": f"ath-{user['id'].split('-')[-1]}",
-            "user_id": user["id"],
             "name": user["display_name"],
             "handle": "@" + user["display_name"].lower().replace(" ", "_"),
             "primary_sport": "Football",
             "skill_level": "intermediate",
         })
-        STORE.link_user_profile(user["id"], profile["id"])
         user["profile_id"] = profile["id"]
         profile_id = profile["id"]
     return {"success": True, "user": _public_user(user), "profile_id": profile_id}
@@ -162,56 +96,50 @@ def logout(response: Response):
 
 @app.get("/api/v1/auth/me")
 def me(user=Depends(get_current_user)):
-    profile = STORE.get_profile(user["profile_id"]) if user.get("profile_id") else None
-    unread_msgs = STORE.get_unread_message_count(profile["id"]) if profile else 0
-    notifs = STORE.get_notifications(user["id"], limit=100)
-    unread_notifs = sum(1 for n in notifs if not n.get("is_read"))
-    return {
-        "success": True,
-        "user": _public_user(user),
-        "profile_id": user.get("profile_id"),
-        "profile": profile,
-        "unread_messages": unread_msgs,
-        "unread_notifications": unread_notifs,
-    }
+    return {"success": True, "user": _public_user(user),
+            "profile_id": user.get("profile_id"),
+            "profile": STORE.get_profile(user["profile_id"])}
 
 
 @app.post("/api/v1/auth/demo")
 def demo(response: Response):
+    """One-click demo: create/return a demo user and log them in."""
     demo_user = STORE.get_user_by_email("demo@sportsphere.dev")
     if not demo_user:
         demo_user = STORE.create_user("demo@sportsphere.dev", hash_password("demo1234"), "Demo Player")
-    if not STORE.get_profile("ath-current-user"):
-        STORE.create_profile({
-            "id": "ath-current-user", "user_id": demo_user["id"], "name": "Demo Player", "handle": "@demo_player",
+        profile = STORE.create_profile({
+            "id": "ath-current-user", "name": "Demo Player", "handle": "@demo_player",
             "primary_sport": "Football", "skill_level": "intermediate",
             "neighborhood": "Kondapur", "bio": "Demo player exploring SportSphere.",
         })
-    STORE.link_user_profile(demo_user["id"], "ath-current-user")
-    demo_user["profile_id"] = "ath-current-user"
+        demo_user["profile_id"] = profile["id"]
+    else:
+        # Ensure the demo profile exists.
+        if not STORE.get_profile("ath-current-user"):
+            profile = STORE.create_profile({
+                "id": "ath-current-user", "name": "Demo Player", "handle": "@demo_player",
+                "primary_sport": "Football", "skill_level": "intermediate",
+                "neighborhood": "Kondapur", "bio": "Demo player exploring SportSphere.",
+            })
+            demo_user["profile_id"] = profile["id"]
     token = create_access_token(demo_user["id"])
     _set_cookie(response, token)
     return {"success": True, "user": _public_user(demo_user), "profile_id": "ath-current-user"}
 
 
 def _public_user(user):
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "display_name": user["display_name"],
-        "profile_id": user.get("profile_id"),
-        "is_admin": bool(user.get("is_admin")),
-    }
+    return {"id": user["id"], "email": user["email"], "display_name": user["display_name"],
+            "profile_id": user.get("profile_id")}
 
 
-def _set_cookie(response: Response, token: str):
+def _set_cookie(response, token):
     response.set_cookie(
         key="access_token",
         value=token,
         httponly=True,
         max_age=int(os.getenv("JWT_EXPIRE_MINUTES", "10080")) * 60,
         samesite="lax",
-        secure=False,
+        secure=False,  # dev only; set True behind HTTPS in prod
         path="/",
     )
 
@@ -227,7 +155,8 @@ def ai_status():
 @app.post("/api/v1/ai/parse-profile")
 def ai_parse_profile(inp: ParseProfileIn):
     parsed = ai._parse_profile(inp.rawText)
-    return {"success": True, "parsed": parsed, "meta": {"source": parsed.get("_source"), "ai_enabled": ai.ai_enabled()}}
+    return {"success": True, "parsed": parsed,
+            "meta": {"source": parsed.get("_source"), "ai_enabled": ai.ai_enabled()}}
 
 
 @app.post("/api/v1/ai/match-explanation")
@@ -251,10 +180,12 @@ def ai_match_explanation(inp: MatchExplanationIn, user=Depends(get_current_profi
                 prof.get("lat", 17.4401), prof.get("lng", 78.3489)),
             "availability": prof.get("availability", []),
             "reliability_rate": prof.get("reliability_rate", 95),
-            "reasonTags": [], "compatibilityScore": 0, "breakdown": {},
+            "reasonTags": [],
+            "compatibilityScore": 0, "breakdown": {},
         })
     expl = ai.match_explanations(requester, candidates)
-    return {"success": True, "explanations": expl, "meta": {"ai_enabled": ai.ai_enabled()}}
+    return {"success": True, "explanations": expl,
+            "meta": {"ai_enabled": ai.ai_enabled()}}
 
 
 @app.post("/api/v1/ai/trust-note")
@@ -268,6 +199,7 @@ def ai_trust_note(inp: TrustNoteIn):
 
 @app.post("/api/v1/ai/performance-summary")
 def ai_perf_summary(inp: PerfSummaryIn):
+    profile = STORE.get_profile(inp.profileId) if inp.profileId else STORE.get_profile("ath-current-user")
     sport = inp.sportId
     metric = sport
     history = STORE.stats_log.get(f"{inp.profileId or 'ath-current-user'}:{sport}", [])
@@ -290,7 +222,7 @@ def _demo_history(sport):
 
 
 # ---------------------------------------------------------------------------
-# Athlete Profiles
+# Profiles
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/athletes")
 def list_athletes():
@@ -298,43 +230,10 @@ def list_athletes():
 
 
 @app.get("/api/v1/athletes/{pid}")
-def get_athlete(pid: str, user=Depends(get_current_profile)):
+def get_athlete(pid: str):
     p = STORE.get_profile(pid)
     if not p:
         raise HTTPException(status_code=404, detail="Athlete not found")
-    # Check if connected and blocked
-    p["is_connected"] = STORE.are_connected(user["id"], pid)
-    p["is_blocked"] = STORE.is_blocked(user["id"], pid)
-    p["connection_count"] = len(STORE.connected_ids(pid))
-
-    # Connection relationship status
-    conn_status = "none"
-    for c in STORE.connections_for(user["id"]):
-        if (c["sender_id"] == user["id"] and c["recipient_id"] == pid) or \
-           (c["recipient_id"] == user["id"] and c["sender_id"] == pid):
-            conn_status = c["status"]
-            break
-    p["connection_status"] = conn_status
-
-    # Tournament history & recent activity (respecting privacy settings)
-    target_uid = p.get("user_id", f"user-{pid}")
-    p["tournament_history"] = STORE.get_registrations(user_id=target_uid)
-    if p.get("show_activity", True):
-        p["recent_activity"] = STORE.get_activities(target_uid, limit=5)
-    else:
-        p["recent_activity"] = []
-
-    # Structured match stats
-    mp = p.get("matches_played", 0) or 0
-    w = p.get("wins", 0) or 0
-    l = p.get("losses", 0) or 0
-    wr = round((w / mp * 100), 1) if mp > 0 else 0
-    p["match_stats"] = {
-        "matches_played": mp,
-        "wins": w,
-        "losses": l,
-        "win_rate": wr,
-    }
     return {"success": True, "data": p}
 
 
@@ -342,67 +241,60 @@ def get_athlete(pid: str, user=Depends(get_current_profile)):
 def create_athlete(inp: CreateProfileIn, user=Depends(get_current_user)):
     data = inp.model_dump(exclude_none=True)
     data["id"] = user.get("profile_id") or f"ath-{user['id'].split('-')[-1]}"
-    data["user_id"] = user["id"]
     profile = STORE.create_profile(data)
+    # Link to user if not already.
     if not user.get("profile_id"):
-        STORE.link_user_profile(user["id"], profile["id"])
         user["profile_id"] = profile["id"]
     return {"success": True, "data": profile}
 
 
-@app.put("/api/v1/athletes/{pid}")
-def update_athlete(pid: str, inp: ProfileUpdateIn, user=Depends(get_current_user)):
-    p = STORE.get_profile(pid)
-    if not p:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    if p["id"] != user.get("profile_id") and not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Cannot edit another user's profile")
-
-    data = inp.model_dump(exclude_none=True)
-    for k, v in data.items():
-        p[k] = v
-    STORE.save_profile(p)
-    return {"success": True, "data": STORE.get_profile(pid)}
-
-
-@app.put("/api/v1/athletes/{pid}/privacy")
-def update_privacy(pid: str, inp: PrivacySettingsIn, user=Depends(get_current_user)):
-    p = STORE.get_profile(pid)
-    if not p:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    if p["id"] != user.get("profile_id"):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    p["discovery_enabled"] = inp.discovery_enabled
-    p["show_activity"] = inp.show_activity
-    p["show_stats"] = inp.show_stats
-    STORE.save_profile(p)
-    return {"success": True, "data": STORE.get_profile(pid)}
+@app.put("/api/v1/athletes/{pid}/sports/{sport_id}")
+def update_sport_telemetry(pid: str, sport_id: str, payload: dict):
+    profile = STORE.get_profile(pid)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Athlete not found")
+    for s in profile.get("sports", []):
+        if s["sport"] == sport_id:
+            s.update(payload)
+            return {"success": True, "data": profile}
+    profile.setdefault("sports", []).append({"sport": sport_id, **payload})
+    return {"success": True, "data": profile}
 
 
 # ---------------------------------------------------------------------------
-# Discovery
+# Discovery (with AI-ranked explanation attached per result)
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/discovery/players")
-def discover_players(lat: float = 17.4401, lng: float = 78.3489, sportId: str = "all",
+def discover_players(request: Request, lat: float = 17.4401, lng: float = 78.3489, sportId: str = "all",
                      skillLevel: str = "all", radiusKm: float = 10, role: str = "",
-                     search: str = "", sortBy: str = "compatibility", limit: int = 30,
+                     search: str = "", sortBy: str = "compatibility", limit: int = 20,
                      profile_id: str = ""):
     query = {"lat": lat, "lng": lng, "sportId": sportId, "skillLevel": skillLevel,
              "radiusKm": radiusKm, "role": role, "search": search,
              "availabilitySlots": [], "limit": limit}
 
-    blocked_users = set(STORE.get_blocked_users(profile_id)) if profile_id else set()
-    connected_users = STORE.connected_ids(profile_id) if profile_id else set()
+    # Automatically resolve caller profile from cookie if not explicitly passed
+    caller_pid = profile_id
+    if not caller_pid or caller_pid == "ath-current-user":
+        try:
+            token = request.cookies.get("access_token")
+            if token:
+                payload = decode_token(token)
+                uid = payload.get("sub")
+                u = STORE.get_user_by_id(uid)
+                if u and u.get("profile_id"):
+                    caller_pid = u["profile_id"]
+        except Exception:
+            pass
 
+    connected_ids = STORE.connected_ids(caller_pid) if caller_pid else set()
     scored = []
+    seen_ids = set()
     for p in STORE.all_profiles():
-        if p.get("id") == profile_id:
+        pid = p.get("id")
+        if not pid or pid == caller_pid or pid in seen_ids:
             continue
-        if p["id"] in blocked_users or (profile_id and STORE.is_blocked(profile_id, p["id"])):
-            continue
-        if not p.get("discovery_enabled", True):
-            continue
-
+        seen_ids.add(pid)
         eval_res = evaluate_compatibility(query, p)
         if eval_res["distanceKm"] > radiusKm:
             continue
@@ -431,10 +323,10 @@ def discover_players(lat: float = 17.4401, lng: float = 78.3489, sportId: str = 
     for entry in scored[:limit]:
         p, ev = entry["profile"], entry["eval"]
         payload = _player_payload(p, ev, lat, lng)
-        payload["is_connected"] = p["id"] in connected_users
+        payload["is_connected"] = p["id"] in connected_ids
         players.append(payload)
 
-    # Batch AI explanations
+    # Generate AI explanations in one batch for the top results.
     candidates = [{"athlete_id": pl["id"], "name": pl["name"], "sport": pl.get("matched_sport", sportId),
                    "skill_level": pl["skill_level"], "role": pl.get("role"),
                    "distanceKm": pl["distanceKm"], "breakdown": pl["breakdown"],
@@ -461,6 +353,7 @@ def discover_players(lat: float = 17.4401, lng: float = 78.3489, sportId: str = 
 
 def _player_payload(p, ev, anchor_lat, anchor_lng):
     matched = ev["matchedSport"] or {}
+    skills = [s["skill_level"] for s in p.get("sports", [])]
     reliability = p.get("reliability_rate", 95)
     return {
         "id": p["id"], "name": p["name"], "handle": p.get("handle", "@athlete"),
@@ -475,17 +368,16 @@ def _player_payload(p, ev, anchor_lat, anchor_lng):
         "distanceKm": ev["distanceKm"],
         "role": matched.get("role", p.get("role")),
         "bio": p.get("bio", ""),
-        "rating": p.get("rating", 4.5),
-        "reliability_rate": reliability,
+        "rating": p.get("rating", 4.5), "reliability_rate": reliability,
         "reliabilityRate": reliability,
         "availability": p.get("availability", []),
         "matches_played": p.get("matches_played", 0),
-        "compatibilityScore": ev["compatibilityScore"],
-        "matchTier": ev["matchTier"],
-        "breakdown": ev["breakdown"],
-        "reasonTags": ev["reasonTags"],
+        "compatibilityScore": ev["compatibilityScore"], "matchTier": ev["matchTier"],
+        "breakdown": ev["breakdown"], "reasonTags": ev["reasonTags"],
         "matched_sport": matched.get("sport", p.get("primary_sport", "")),
-        "tags": ev["reasonTags"],
+        "skill_scale": {"canonical": [1, 2, 3, 4], "normalized_to": matched.get("skill_level", p.get("skill_level"))},
+        "tags": ev["reasonTags"], "stats": {"reliability": f"{reliability}%",
+                                            "matches": p.get("matches_played", 0)},
     }
 
 
@@ -505,7 +397,8 @@ def discover_teams(lat: float = 17.4401, lng: float = 78.3489, sportId: str = "a
 
 
 @app.get("/api/v1/discovery/events")
-def discover_events(lat: float = 17.4401, lng: float = 78.3489, radiusKm: float = 15, sportId: str = "all"):
+def discover_events(lat: float = 17.4401, lng: float = 78.3489, radiusKm: float = 15,
+                    sportId: str = "all"):
     results = []
     for e in STORE.events.values():
         d = calculate_distance_km(lat, lng, e["lat"], e["lng"])
@@ -527,624 +420,207 @@ def discover_events(lat: float = 17.4401, lng: float = 78.3489, radiusKm: float 
 def connection_request(inp: ConnectionRequestIn, user=Depends(get_current_profile)):
     if inp.recipientId == user["id"]:
         raise HTTPException(status_code=400, detail="Cannot connect with yourself")
-    if STORE.is_blocked(user["id"], inp.recipientId):
-        raise HTTPException(status_code=403, detail="Cannot connect with this user")
+
+    # If a connection between these two athletes already exists, accept it immediately
+    for c in STORE.connections.values():
+        if (c["sender_id"] == user["id"] and c["recipient_id"] == inp.recipientId) or \
+           (c["sender_id"] == inp.recipientId and c["recipient_id"] == user["id"]):
+            c["status"] = "accepted"
+            STORE.get_or_create_conversation(user["id"], inp.recipientId)
+            return {"success": True, "connection": c, "auto_accepted": True}
+
     con = STORE.create_connection(user["id"], inp.recipientId, inp.sportId, inp.type, inp.message)
-    return {"success": True, "connection": con}
+    con["status"] = "accepted"
+    STORE.get_or_create_conversation(user["id"], inp.recipientId)
+
+    return {"success": True, "connection": con, "auto_accepted": True}
 
 
 @app.get("/api/v1/connections/status/{recipient_id}")
 def connection_status(recipient_id: str, user=Depends(get_current_profile)):
-    for c in STORE.connections_for(user["id"]):
-        if (c["sender_id"] == user["id"] and c["recipient_id"] == recipient_id) or \
-           (c["recipient_id"] == user["id"] and c["sender_id"] == recipient_id):
+    for c in STORE.connections.values():
+        if c["sender_id"] == user["id"] and c["recipient_id"] == recipient_id:
             return {"success": True, "status": c["status"], "connection": c}
     return {"success": True, "status": "none", "connection": None}
 
 
 @app.post("/api/v1/connections/respond")
 def connection_respond(inp: ConnectionRespondIn, user=Depends(get_current_profile)):
-    con = STORE.get_connection_by_id(inp.connectionId)
+    con = STORE.connections.get(inp.connectionId)
     if not con:
         raise HTTPException(status_code=404, detail="Connection not found")
-    if con["recipient_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Not your connection to respond to")
-    new_status = "accepted" if inp.accept else "declined"
-    updated = STORE.update_connection_status(inp.connectionId, new_status)
-    return {"success": True, "connection": updated}
+    if con["recipient_id"] != user["id"] and con["sender_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your connection to respond")
+    con["status"] = "accepted" if inp.accept else "declined"
+    if inp.accept:
+        STORE.get_or_create_conversation(con["sender_id"], con["recipient_id"])
+    return {"success": True, "connection": con}
 
 
 @app.get("/api/v1/connections")
 def list_connections(user=Depends(get_current_profile)):
-    cons = STORE.connections_for(user["id"])
-    return {"success": True, "data": {"connections": cons, "connected": list(STORE.connected_ids(user["id"]))}}
+    cons = []
+    for c in STORE.connections_for(user["id"]):
+        e = dict(c)
+        # Resolve the "other" athlete so the UI can show who it is + their sport.
+        other_id = c["sender_id"] if c["recipient_id"] == user["id"] else c["recipient_id"]
+        other = STORE.get_profile(other_id) or {}
+        sport = (other.get("sports") or [{}])[0].get("sport", other.get("primary_sport", ""))
+        e["other_id"] = other_id
+        e["other_name"] = other.get("name", "Athlete")
+        e["other_avatar"] = other.get("avatar", "")
+        e["other_sport"] = sport
+        e["is_incoming"] = (c["recipient_id"] == user["id"])
+        cons.append(e)
+
+    # Accepted friends, with their sport, for the map + chat.
+    friends = []
+    for pid in STORE.connected_ids(user["id"]):
+        prof = STORE.get_profile(pid) or {}
+        sport = (prof.get("sports") or [{}])[0].get("sport", prof.get("primary_sport", ""))
+        conv = STORE.get_or_create_conversation(user["id"], pid)
+        friends.append({
+            "id": pid, "name": prof.get("name", "Athlete"), "avatar": prof.get("avatar", ""),
+            "sport": sport, "skill_level": (prof.get("sports") or [{}])[0].get("skill_level", prof.get("skill_level")),
+            "lat": prof.get("lat"), "lng": prof.get("lng"),
+            "city": prof.get("city", "Hyderabad"), "neighborhood": prof.get("neighborhood", ""),
+            "conversation_id": conv["id"],
+        })
+    return {"success": True, "data": {"connections": cons, "connected": list(STORE.connected_ids(user["id"])), "friends": friends}}
 
 
 # ---------------------------------------------------------------------------
-# Connection-Based Chat & Safety
+# Chat
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/chat/conversations")
 def get_conversations(user=Depends(get_current_profile)):
     convs = []
-    unread_map = STORE.get_unread_per_conversation(user["id"])
     for c in STORE.conversations_for(user["id"]):
         other_id = next((p for p in c["participants"] if p != user["id"]), None)
         other = STORE.get_profile(other_id) or {}
-        msgs = STORE.get_messages(c["id"])
-        last_msg = msgs[-1]["body"] if msgs else ""
-        convs.append({
-            "id": c["id"],
-            "with_id": other_id,
-            "with_name": other.get("name", "Athlete"),
-            "with_avatar": other.get("avatar", ""),
-            "last_message": last_msg,
-            "unread": unread_map.get(c["id"], 0),
-            "updated_at": c.get("updated_at", c["created_at"]),
-            "is_connected": STORE.are_connected(user["id"], other_id),
-            "is_blocked": STORE.is_blocked(user["id"], other_id),
-        })
+        sport = (other.get("sports") or [{}])[0].get("sport", other.get("primary_sport", ""))
+        unread = sum(1 for m in c.get("messages", []) if m.get("sender_id") != user["id"] and not m.get("read"))
+        convs.append({"id": c["id"], "with_id": other_id, "with_name": other.get("name", "Athlete"),
+                      "with_avatar": other.get("avatar", ""), "with_sport": sport,
+                      "last_message": (c["messages"][-1]["body"] if c["messages"] else ""),
+                      "unread": unread,
+                      "updated_at": c.get("updated_at", c["created_at"])})
     convs.sort(key=lambda x: x["updated_at"], reverse=True)
     return {"success": True, "data": convs}
 
 
 @app.get("/api/v1/chat/conversations/{cid}/messages")
 def get_messages(cid: str, user=Depends(get_current_profile)):
-    con = STORE.get_conversation_by_id(cid)
+    con = STORE.get_conversation(cid)
     if not con:
-        if "::" in cid:
-            parts = cid.split("::")
-            if len(parts) == 2 and user["id"] in parts:
-                other_id = parts[0] if parts[1] == user["id"] else parts[1]
-                if not STORE.are_connected(user["id"], other_id):
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Chat is enabled only after your connection request has been accepted.",
-                    )
-                con = STORE.get_or_create_conversation(user["id"], other_id)
-        if not con:
-            return {"success": True, "messages": []}
+        return {"success": True, "messages": []}
     if user["id"] not in con["participants"]:
         raise HTTPException(status_code=403, detail="Not part of this conversation")
-
-    other_id = next((p for p in con["participants"] if p != user["id"]), None)
-    # Check if blocked
-    if other_id and STORE.is_blocked(user["id"], other_id):
-        raise HTTPException(status_code=403, detail="This conversation is blocked")
-
-    # Mark incoming messages read
-    STORE.mark_conversation_read(cid, user["id"])
-    msgs = STORE.get_messages(cid)
-    return {"success": True, "messages": msgs}
-
-
-@app.post("/api/v1/chat/conversations/{cid}/messages")
-async def send_message(cid: str, inp: MessageIn, user=Depends(get_current_profile)):
-    body = sanitize_text(inp.body)
-    if not body:
-        raise HTTPException(status_code=400, detail="Message body cannot be empty")
-
-    con = STORE.get_conversation_by_id(cid)
-    if not con:
-        if "::" in cid:
-            parts = cid.split("::")
-            if len(parts) == 2 and user["id"] in parts:
-                other_id = parts[0] if parts[1] == user["id"] else parts[1]
-                if not STORE.are_connected(user["id"], other_id):
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Chat is enabled only after your connection request has been accepted.",
-                    )
-                con = STORE.get_or_create_conversation(user["id"], other_id)
-        if not con:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-    if user["id"] not in con["participants"]:
-        raise HTTPException(status_code=403, detail="Not part of this conversation")
-
-    other_id = next((p for p in con["participants"] if p != user["id"]), None)
-    if not other_id:
-        raise HTTPException(status_code=400, detail="Invalid conversation participants")
-
-    # RULE ENFORCEMENT: A user can message another user ONLY after connection request has been accepted
-    if not STORE.are_connected(user["id"], other_id):
-        raise HTTPException(
-            status_code=403,
-            detail="Chat is enabled only after your connection request has been accepted.",
-        )
-
-    # BLOCK ENFORCEMENT: Cannot message if blocked
-    if STORE.is_blocked(user["id"], other_id):
-        raise HTTPException(status_code=403, detail="Cannot send message. Communication is blocked.")
-
-    msg = STORE.add_message(cid, user["id"], other_id, body)
-    # Broadcast via WebSocket if recipient is connected
-    await WS_MANAGER.broadcast_chat_message(other_id, msg)
-    return {"success": True, "message": msg}
+    # Automatically mark incoming messages as read when viewing
+    STORE.mark_conversation_read(con["id"], user["id"])
+    return {"success": True, "messages": con["messages"]}
 
 
 @app.post("/api/v1/chat/conversations/{cid}/read")
-async def mark_read(cid: str, user=Depends(get_current_profile)):
-    STORE.mark_conversation_read(cid, user["id"])
-    con = STORE.get_conversation_by_id(cid)
-    if con:
-        other_id = next((p for p in con["participants"] if p != user["id"]), None)
-        if other_id:
-            await WS_MANAGER.broadcast_read_status(other_id, cid)
-    return {"success": True}
+def mark_read(cid: str, user=Depends(get_current_profile)):
+    con = STORE.get_conversation(cid)
+    marked = STORE.mark_conversation_read(con["id"] if con else cid, user["id"])
+    return {"success": True, "marked": marked}
 
 
-@app.post("/api/v1/users/{uid}/block")
-def block_user(uid: str, user=Depends(get_current_profile)):
-    if uid == user["id"]:
-        raise HTTPException(status_code=400, detail="Cannot block yourself")
-    STORE.block_user(user["id"], uid)
-    return {"success": True, "message": f"User {uid} has been blocked."}
+@app.post("/api/v1/chat/conversations/{cid}/messages")
+def send_message(cid: str, inp: MessageIn, user=Depends(get_current_profile)):
+    con = STORE.get_conversation(cid)
+    if not con:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if user["id"] not in con["participants"]:
+        raise HTTPException(status_code=403, detail="Not part of this conversation")
+    msg = {"id": f"msg-{len(con['messages'])}", "sender_id": user["id"],
+           "body": inp.body, "created_at": int(__import__("time").time() * 1000),
+           "read": False}
+    con["messages"].append(msg)
+    con["updated_at"] = msg["created_at"]
+    return {"success": True, "message": msg}
 
-
-@app.post("/api/v1/users/{uid}/unblock")
-def unblock_user(uid: str, user=Depends(get_current_profile)):
-    STORE.unblock_user(user["id"], uid)
-    return {"success": True, "message": f"User {uid} unblocked."}
-
-
-@app.get("/api/v1/users/blocked")
-def get_blocked(user=Depends(get_current_profile)):
-    return {"success": True, "blocked_ids": STORE.get_blocked_users(user["id"])}
-
-
-@app.post("/api/v1/users/{uid}/report")
-def report_user(uid: str, inp: ReportIn, user=Depends(get_current_profile)):
-    STORE.report_target(
-        reporter_id=user["id"],
-        reported_id=uid,
-        target_type="user",
-        target_id=inp.targetId,
-        reason=sanitize_text(inp.reason),
-        details=sanitize_text(inp.details or ""),
-    )
-    return {"success": True, "message": "Report submitted for administrator review. Thank you for keeping PLAYSync safe."}
-
-
-@app.post("/api/v1/chat/messages/{mid}/report")
-def report_message(mid: str, inp: ReportIn, user=Depends(get_current_profile)):
-    STORE.report_target(
-        reporter_id=user["id"],
-        reported_id=inp.reportedId,
-        target_type="message",
-        target_id=mid,
-        reason=sanitize_text(inp.reason),
-        details=sanitize_text(inp.details or ""),
-    )
-    return {"success": True, "message": "Message reported for review."}
 
 
 # ---------------------------------------------------------------------------
-# Personalization & Recommendations
+# Community Posts
 # ---------------------------------------------------------------------------
-@app.get("/api/v1/recommendations/players")
-def recommend_players(user=Depends(get_current_profile)):
-    recommended = get_recommended_players(user, limit=12)
-    return {"success": True, "data": recommended}
+@app.get("/api/v1/community/posts")
+def list_community_posts():
+    posts = STORE.get_community_posts()
+    return {"success": True, "data": posts}
 
 
-@app.get("/api/v1/recommendations/tournaments")
-def recommend_tournaments(user=Depends(get_current_user)):
-    profile = STORE.get_profile(user.get("profile_id")) or {"id": "ath-current-user"}
-    tournaments = get_recommended_tournaments(profile, user["id"], limit=6)
-    return {"success": True, "data": tournaments}
+@app.post("/api/v1/community/posts")
+def create_community_post(payload: dict, user=Depends(get_current_profile)):
+    content = payload.get("content", "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    post = STORE.create_community_post(user, payload)
+    return {"success": True, "data": post}
 
 
-@app.get("/api/v1/personalization/home")
-def personalized_home(user=Depends(get_current_user)):
-    profile = STORE.get_profile(user.get("profile_id")) or {
-        "id": "ath-current-user", "name": user["display_name"], "primary_sport": "Football"
-    }
-    feed = get_personalized_home_feed(user, profile)
-    return {"success": True, "data": feed}
-
-
-# ---------------------------------------------------------------------------
-# Tournaments & Registrations
-# ---------------------------------------------------------------------------
-@app.get("/api/v1/tournaments")
-def list_tournaments(sport_id: Optional[str] = None):
-    return {"success": True, "data": STORE.get_tournaments(sport_id)}
-
-
-@app.get("/api/v1/tournaments/{tid}")
-def get_tournament(tid: str):
-    t = STORE.get_tournament(tid)
-    if not t:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-    return {"success": True, "data": t}
-
-
-@app.post("/api/v1/tournaments/{tid}/register")
-def direct_register(tid: str, inp: TournamentRegisterIn, user=Depends(get_current_user)):
-    t = STORE.get_tournament(tid)
-    if not t:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-    if STORE.is_registered(tid, user["id"]):
-        raise HTTPException(status_code=400, detail="Already registered for this tournament")
-    if t.get("entry_fee", 0.0) > 0:
-        raise HTTPException(status_code=400, detail="This tournament requires payment checkout")
-
-    reg = STORE.register_for_tournament(
-        tournament_id=tid,
-        user_id=user["id"],
-        profile_id=user.get("profile_id") or f"ath-{user['id']}",
-        team_name=sanitize_text(inp.teamName or ""),
-    )
-    return {"success": True, "registration": reg}
+@app.post("/api/v1/community/posts/{pid}/like")
+def like_community_post(pid: str):
+    post = STORE.like_community_post(pid)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return {"success": True, "data": post}
 
 
 # ---------------------------------------------------------------------------
-# Payments & Checkout (Razorpay)
-# ---------------------------------------------------------------------------
-@app.post("/api/v1/payments/create-order")
-def create_payment_order(inp: CreateOrderIn, user=Depends(get_current_user)):
-    try:
-        order_data = create_order(
-            tournament_id=inp.tournamentId,
-            user_id=user["id"],
-            discount_code=inp.discountCode,
-        )
-        return {"success": True, "data": order_data}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Order creation failed: {str(e)}")
-
-
-@app.post("/api/v1/payments/verify")
-def verify_payment(inp: VerifyPaymentIn, user=Depends(get_current_user)):
-    payment_record = STORE.get_payment_by_order_id(inp.orderId)
-    if not payment_record:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if payment_record["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized payment verification")
-
-    # Idempotent: if already successful, return confirmation without duplicate charge
-    if payment_record["status"] == "successful":
-        regs = STORE.get_registrations(tournament_id=inp.tournamentId, user_id=user["id"])
-        return {
-            "success": True,
-            "message": "Payment already confirmed.",
-            "payment": payment_record,
-            "registration": regs[0] if regs else None,
-        }
-
-    # Verify signature
-    is_valid = verify_payment_signature(inp.orderId, inp.paymentId, inp.signature)
-    if not is_valid:
-        STORE.update_payment(inp.orderId, "failed", inp.paymentId, inp.signature)
-        raise HTTPException(status_code=400, detail="Invalid cryptographic payment signature")
-
-    # Mark payment successful
-    STORE.update_payment(inp.orderId, "successful", inp.paymentId, inp.signature)
-    updated_payment = STORE.get_payment_by_order_id(inp.orderId)
-
-    # Record discount usage if applicable
-    if updated_payment.get("discount_code"):
-        disc = STORE.get_discount_by_code(updated_payment["discount_code"])
-        if disc:
-            STORE.record_discount_usage(disc["id"], user["id"], updated_payment["id"])
-
-    # Confirm tournament registration
-    reg = STORE.register_for_tournament(
-        tournament_id=inp.tournamentId,
-        user_id=user["id"],
-        profile_id=user.get("profile_id") or f"ath-{user['id']}",
-        payment_id=updated_payment["id"],
-        team_name=sanitize_text(inp.teamName or ""),
-    )
-
-    return {
-        "success": True,
-        "message": "Payment verified and tournament registration confirmed!",
-        "payment": updated_payment,
-        "registration": reg,
-    }
-
-
-@app.get("/api/v1/payments/receipt/{pid}")
-def get_receipt(pid: str, user=Depends(get_current_user)):
-    pay = STORE.get_payment_by_id(pid)
-    if not pay:
-        raise HTTPException(status_code=404, detail="Payment receipt not found")
-    if pay["user_id"] != user["id"] and not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    tournament = STORE.get_tournament(pay["tournament_id"])
-    regs = STORE.get_registrations(tournament_id=pay["tournament_id"], user_id=pay["user_id"])
-    return {
-        "success": True,
-        "receipt": {
-            "payment": pay,
-            "tournament": tournament,
-            "registration": regs[0] if regs else None,
-            "billed_to": user["display_name"],
-            "billed_email": user["email"],
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# Discounts
-# ---------------------------------------------------------------------------
-@app.post("/api/v1/discounts/validate")
-def check_discount(inp: ValidateDiscountIn, user=Depends(get_current_user)):
-    ok, msg, disc, pricing = validate_discount(inp.code, inp.tournamentId, user["id"])
-    if not ok:
-        raise HTTPException(status_code=400, detail=msg)
-    return {"success": True, "message": msg, "discount": disc, "pricing": pricing}
-
-
-@app.get("/api/v1/discounts/available")
-def list_discounts():
-    return {"success": True, "data": STORE.all_discounts(active_only=True)}
-
-
-# ---------------------------------------------------------------------------
-# Central Notification Center
+# Notifications
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/notifications")
-def get_notifications(category: Optional[str] = None, user=Depends(get_current_user)):
-    notifs = STORE.get_notifications(user["id"], category=category)
-    return {"success": True, "data": notifs}
+def get_notifications(user=Depends(get_current_profile)):
+    # 1. Unread chat messages
+    unread_messages = []
+    unread_count = 0
+    for c in STORE.conversations_for(user["id"]):
+        other_id = next((p for p in c["participants"] if p != user["id"]), None)
+        other = STORE.get_profile(other_id) or {}
+        for m in c.get("messages", []):
+            if m.get("sender_id") != user["id"] and not m.get("read"):
+                unread_count += 1
+                unread_messages.append({
+                    "id": m["id"],
+                    "conversation_id": c["id"],
+                    "sender_id": m["sender_id"],
+                    "sender_name": other.get("name", "Athlete"),
+                    "sender_avatar": other.get("avatar", ""),
+                    "body": m["body"],
+                    "created_at": m["created_at"],
+                })
 
+    # 2. Incoming pending connection requests
+    pending_requests = []
+    for c in STORE.connections_for(user["id"]):
+        if c.get("recipient_id") == user["id"] and c.get("status") == "pending":
+            sender = STORE.get_profile(c["sender_id"]) or {}
+            pending_requests.append({
+                "connection_id": c["id"],
+                "sender_id": c["sender_id"],
+                "sender_name": sender.get("name", "Athlete"),
+                "sender_avatar": sender.get("avatar", ""),
+                "sport_id": c.get("sport_id", ""),
+                "message": c.get("message", ""),
+                "created_at": c.get("created_at"),
+            })
 
-@app.patch("/api/v1/notifications/{nid}/read")
-def read_notification(nid: str, user=Depends(get_current_user)):
-    STORE.mark_notification_read(nid, user["id"])
-    return {"success": True}
-
-
-@app.post("/api/v1/notifications/mark-all-read")
-def read_all_notifications(user=Depends(get_current_user)):
-    STORE.mark_all_notifications_read(user["id"])
-    return {"success": True}
-
-
-@app.get("/api/v1/notifications/preferences")
-def get_preferences(user=Depends(get_current_user)):
-    prefs = STORE.get_notification_preferences(user["id"])
-    return {"success": True, "data": prefs}
-
-
-@app.put("/api/v1/notifications/preferences")
-def update_preferences(inp: NotificationPreferencesIn, user=Depends(get_current_user)):
-    STORE.update_notification_preferences(user["id"], inp.model_dump())
-    return {"success": True, "data": STORE.get_notification_preferences(user["id"])}
-
-
-# ---------------------------------------------------------------------------
-# Tournament Notification Dispatchers
-# ---------------------------------------------------------------------------
-def _dispatch_new_tournament_notifications(t: dict):
-    sport_id = (t.get("sport_id") or "").lower()
-    t_lat = float(t.get("lat") or 17.4401)
-    t_lng = float(t.get("lng") or 78.3489)
-    title = t.get("title", "New Tournament")
-    venue = t.get("venue", "Hyderabad")
-    deadline = t.get("registration_deadline", "soon")
-
-    for p in STORE.all_profiles():
-        uid = p.get("user_id", f"user-{p['id']}")
-        prefs = STORE.get_notification_preferences(uid)
-        if not prefs.get("tournament_alerts", True):
-            continue
-
-        athlete_sports = [s.get("sport", "").lower() for s in p.get("sports", [])]
-        if not athlete_sports and p.get("primary_sport"):
-            athlete_sports = [p["primary_sport"].lower()]
-
-        sport_match = (sport_id in athlete_sports) or ("all" in athlete_sports) or (not sport_id)
-        dist = calculate_distance_km(t_lat, t_lng, float(p.get("lat", 17.4401)), float(p.get("lng", 78.3489)))
-        is_nearby = dist <= 25.0
-
-        if sport_match or is_nearby:
-            if sport_match and is_nearby:
-                notif_title = f"🏆 New {sport_id.capitalize()} Tournament Nearby"
-                notif_msg = f"{title} matching your profile is now open at {venue} ({dist:.1f} km away). Register before {deadline}!"
-            elif sport_match:
-                notif_title = f"🏆 New {sport_id.capitalize()} Tournament Open"
-                notif_msg = f"A new {sport_id.capitalize()} tournament matching your profile is now open: {title}."
-            else:
-                notif_title = "📍 Tournament Happening Near You"
-                notif_msg = f"{title} is taking place near your area ({venue}, {dist:.1f} km away)."
-
-            STORE.create_notification(
-                user_id=uid,
-                category="tournaments",
-                title=notif_title,
-                message=notif_msg,
-                related_entity_id=t["id"],
-                action_url="/app/tournaments",
-            )
-
-
-def _dispatch_tournament_update_notifications(old_t: Optional[dict], new_t: dict):
-    if not old_t or not new_t:
-        return
-    tid = new_t["id"]
-    title = new_t.get("title", "Tournament")
-    status = new_t.get("status", "open")
-    old_status = old_t.get("status", "open")
-
-    regs = STORE.get_registrations(tournament_id=tid)
-    notified_users = set()
-
-    for r in regs:
-        uid = r["user_id"]
-        if uid in notified_users:
-            continue
-        notified_users.add(uid)
-
-        if status == "cancelled" and old_status != "cancelled":
-            n_title = f"⚠️ Tournament Cancelled: {title}"
-            n_msg = f"We regret to inform you that {title} has been cancelled. Any payments are queued for refund."
-        else:
-            n_title = f"ℹ️ Tournament Update: {title}"
-            n_msg = f"{title} details have been updated. Date: {new_t.get('starts_at')}, Venue: {new_t.get('venue')}."
-
-        STORE.create_notification(
-            user_id=uid,
-            category="tournaments",
-            title=n_title,
-            message=n_msg,
-            related_entity_id=tid,
-            action_url="/app/tournaments",
-        )
+    return {
+        "success": True,
+        "data": {
+            "unread_count": unread_count + len(pending_requests),
+            "unread_messages": unread_messages,
+            "pending_requests": pending_requests,
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
-# Admin Capabilities
-# ---------------------------------------------------------------------------
-@app.post("/api/v1/admin/tournaments")
-def admin_create_tournament(inp: TournamentIn, admin=Depends(require_admin)):
-    t = STORE.create_tournament(inp.model_dump())
-    _dispatch_new_tournament_notifications(t)
-    return {"success": True, "data": t}
-
-
-@app.put("/api/v1/admin/tournaments/{tid}")
-def admin_update_tournament(tid: str, inp: TournamentUpdateIn, admin=Depends(require_admin)):
-    old_t = STORE.get_tournament(tid)
-    t = STORE.update_tournament(tid, inp.model_dump(exclude_none=True))
-    if not t:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-    _dispatch_tournament_update_notifications(old_t, t)
-    return {"success": True, "data": t}
-
-
-@app.post("/api/v1/tournaments/{tid}/remind")
-def remind_tournament_deadline(tid: str, admin=Depends(require_admin)):
-    t = STORE.get_tournament(tid)
-    if not t:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-    sent_count = 0
-    for p in STORE.all_profiles():
-        uid = p.get("user_id", f"user-{p['id']}")
-        if STORE.is_registered(tid, uid):
-            continue
-        prefs = STORE.get_notification_preferences(uid)
-        if not prefs.get("tournament_alerts", True):
-            continue
-        STORE.create_notification(
-            user_id=uid,
-            category="tournaments",
-            title=f"⏰ Registration Closing Soon: {t['title']}",
-            message=f"Registration for {t['title']} closes {t.get('registration_deadline', 'soon')}. Secure your spot now!",
-            related_entity_id=tid,
-            action_url="/app/tournaments",
-        )
-        sent_count += 1
-    return {"success": True, "sent_count": sent_count}
-
-
-@app.get("/api/v1/admin/registrations")
-def admin_registrations(admin=Depends(require_admin)):
-    return {"success": True, "data": STORE.get_registrations()}
-
-
-@app.post("/api/v1/admin/discounts")
-def admin_create_discount(inp: CreateDiscountIn, admin=Depends(require_admin)):
-    d = STORE.create_discount(inp.model_dump())
-    return {"success": True, "data": d}
-
-
-@app.patch("/api/v1/admin/discounts/{did}/toggle")
-def admin_toggle_discount(did: str, admin=Depends(require_admin)):
-    disc = STORE.get_discount_by_code(did) or STORE.get_tournament(did)  # handle code or id
-    from .db import DB
-    row = DB.fetchone("SELECT active FROM discounts WHERE id = ? OR code = ?", (did, did))
-    if not row:
-        raise HTTPException(status_code=404, detail="Discount not found")
-    new_status = 0 if row["active"] else 1
-    DB.execute("UPDATE discounts SET active = ? WHERE id = ? OR code = ?", (new_status, did, did))
-    return {"success": True, "active": bool(new_status)}
-
-
-@app.get("/api/v1/admin/payments")
-def admin_payments(admin=Depends(require_admin)):
-    return {"success": True, "data": STORE.all_payments()}
-
-
-@app.post("/api/v1/admin/payments/{pid}/refund")
-def admin_refund(pid: str, inp: RefundIn, admin=Depends(require_admin)):
-    refunded = STORE.refund_payment(pid)
-    if not refunded:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    # Also notify user
-    STORE.create_notification(
-        user_id=refunded["user_id"],
-        category="system",
-        title="💳 Payment Refund Processed",
-        message=f"Refund of ₹{refunded['total_amount']} has been initiated: {inp.reason or 'Admin processed refund'}.",
-        related_entity_id=refunded["id"],
-    )
-    return {"success": True, "payment": refunded}
-
-
-@app.post("/api/v1/admin/announcements")
-async def admin_announcement(inp: AnnouncementIn, admin=Depends(require_admin)):
-    t = STORE.get_tournament(inp.tournamentId)
-    title = sanitize_text(inp.title)
-    msg = sanitize_text(inp.message)
-
-    # Broadcast notification to matched athletes
-    sport = inp.sportId or (t["sport_id"] if t else None)
-    for p in STORE.all_profiles():
-        user_id = p.get("user_id", f"user-{p['id']}")
-        # check preferences
-        prefs = STORE.get_notification_preferences(user_id)
-        if not prefs.get("tournament_alerts", True):
-            continue
-        STORE.create_notification(
-            user_id=user_id,
-            category="tournaments",
-            title=title,
-            message=msg,
-            related_entity_id=inp.tournamentId,
-            action_url="/app/tournaments",
-        )
-        await WS_MANAGER.broadcast_notification(p["id"], {"title": title, "message": msg})
-    return {"success": True, "message": "Announcement broadcast successfully."}
-
-
-@app.get("/api/v1/admin/reports")
-def admin_reports(status: Optional[str] = None, admin=Depends(require_admin)):
-    return {"success": True, "data": STORE.get_reports(status)}
-
-
-@app.post("/api/v1/admin/reports/{rid}/resolve")
-def admin_resolve_report(rid: str, admin=Depends(require_admin)):
-    STORE.resolve_report(rid, status="resolved")
-    return {"success": True}
-
-
-# ---------------------------------------------------------------------------
-# WebSocket
-# ---------------------------------------------------------------------------
-@app.websocket("/api/v1/ws/chat/{profile_id}")
-async def chat_websocket(websocket: WebSocket, profile_id: str):
-    await WS_MANAGER.connect(profile_id, websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            # Heartbeats or incoming client ping
-            try:
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    await websocket.send_text(json.dumps({"type": "pong"}))
-            except Exception:
-                pass
-    except WebSocketDisconnect:
-        WS_MANAGER.disconnect(profile_id, websocket)
-
-
-# ---------------------------------------------------------------------------
-# Events (pickup games)
+# Events
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/events")
 def list_events():
@@ -1153,7 +629,38 @@ def list_events():
         e2 = dict(e)
         e2["joined"] = len(e.get("participants", []))
         evs.append(e2)
+    # Newest-first so an event you just added appears at the top.
+    evs.sort(key=lambda x: x.get("created_at", 0), reverse=True)
     return {"success": True, "data": evs}
+
+
+@app.post("/api/v1/events/{eid}/pay")
+def pay_and_join(eid: str, user=Depends(get_current_profile)):
+    """Simulated payment gateway + join. Records a mock payment and adds the athlete."""
+    if eid not in STORE.events:
+        raise HTTPException(status_code=404, detail="Event not found")
+    ev = STORE.events[eid]
+    price = ev.get("price", "Free")
+    amount = 0.0
+    if not (price and str(price).lower() in ("free", "", "0", "rs.0", "₹0", "0 rs")):
+        digits = "".join(c for c in str(price) if c.isdigit())
+        amount = float(digits or 0)
+    payment = STORE.record_payment(user["id"], eid, amount)
+    STORE.add_participant(eid, user["id"], "joined")
+    return {"success": True, "payment": payment, "event": _event_payload(eid)}
+
+
+@app.get("/api/v1/me/events")
+def my_events(user=Depends(get_current_profile)):
+    """Summary of the current user's events: joined, money spent, payment history."""
+    joined_ids = STORE.joined_event_ids(user["id"])
+    events = [_event_payload(eid) for eid in joined_ids]
+    payments = STORE.payments_for(user["id"])
+    spend = STORE.total_spent(user["id"])
+    return {"success": True, "data": {
+        "events": events, "payments": payments,
+        "money_spent": spend, "count": len(events),
+    }}
 
 
 @app.post("/api/v1/events")
@@ -1207,20 +714,9 @@ def get_schema(sid: str):
     return {"success": True, "data": {"sport": sid, "metrics": SPORT_METRICS.get(sid, [])}}
 
 
+# ---------------------------------------------------------------------------
+# Generic error handler so JSON is always returned (frontend expects JSON)
+# ---------------------------------------------------------------------------
 @app.exception_handler(Exception)
 def generic_handler(request: Request, exc: Exception):
-    if isinstance(exc, HTTPException):
-        return JSONResponse(status_code=exc.status_code, content={"success": False, "message": exc.detail})
     return JSONResponse(status_code=500, content={"success": False, "message": str(exc)})
-
-
-# SPA fallback router for unified frontend delivery
-if DIST_DIR and (DIST_DIR / "index.html").is_file():
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        if full_path.startswith("api/") or full_path == "health" or full_path.startswith("docs") or full_path.startswith("openapi.json"):
-            raise HTTPException(status_code=404, detail="Not Found")
-        target_file = DIST_DIR / full_path
-        if full_path and target_file.is_file():
-            return FileResponse(target_file)
-        return FileResponse(DIST_DIR / "index.html")

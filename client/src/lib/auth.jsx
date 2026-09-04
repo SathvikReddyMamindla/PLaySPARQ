@@ -19,8 +19,6 @@ export function AuthProvider({ children }) {
     } catch (e) {
       // not authenticated
     }
-    setUser(null);
-    setProfile(null);
     return false;
   };
 
@@ -31,19 +29,31 @@ export function AuthProvider({ children }) {
     })();
   }, []);
 
+  // Apply auth from a register/login response as a safety net so the user is
+  // never left null right after a successful signup (which would drop them on
+  // the "Sign in to continue" gate).
+  const applyAuth = (user, profile) => { setUser(user); setProfile(profile); };
+  const fromAuthRes = (u) => ({
+    id: u?.id, email: u?.email, display_name: u?.display_name, profile_id: u?.profile_id,
+  });
+
   const login = async (email, password) => {
-    await api.login({ email, password });
-    await refresh();
+    const res = await api.login({ email, password });
+    const ok = await refresh();
+    if (!ok && res?.success) applyAuth(fromAuthRes(res.user), null);
+    return ok || !!res?.success;
   };
   const register = async (email, password, displayName) => {
-    await api.register({ email, password, displayName });
-    await refresh();
-    return true;
+    const res = await api.register({ email, password, displayName });
+    const ok = await refresh();
+    if (!ok && res?.success) applyAuth(fromAuthRes(res.user), null);
+    return ok || !!res?.success;
   };
   const demo = async () => {
-    await api.demo();
-    await refresh();
-    return true;
+    const res = await api.demo();
+    const ok = await refresh();
+    if (!ok && res?.success) applyAuth(fromAuthRes(res.user), null);
+    return ok || !!res?.success;
   };
   const logout = async () => {
     try { await api.logout(); } catch (e) {}

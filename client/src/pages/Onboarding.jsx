@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Sparkles, ArrowRight, Loader2, CheckCircle2, MapPin, Pencil, RefreshCw, Save, X, Users, LocateFixed } from 'lucide-react';
+import { Sparkles, ArrowRight, Loader2, CheckCircle2, MapPin, Pencil, RefreshCw, Save, X, Users, LocateFixed, Plus } from 'lucide-react';
 import { useNavigate, Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -10,6 +10,12 @@ import Badge from '../components/ui/Badge';
 import { JoinModal } from '../components/Modals';
 
 const sportEmoji = { football: '⚽', cricket: '🏏', badminton: '🏸', basketball: '🏀', swimming: '🏊', tennis: '🎾', athletics: '🏃', chess: '♟️', 'athletics & running': '🏃' };
+const ALL_SPORTS = [
+  { id: 'football', name: 'Football', emoji: '⚽' }, { id: 'cricket', name: 'Cricket', emoji: '🏏' },
+  { id: 'badminton', name: 'Badminton', emoji: '🏸' }, { id: 'basketball', name: 'Basketball', emoji: '🏀' },
+  { id: 'swimming', name: 'Swimming', emoji: '🏊' }, { id: 'tennis', name: 'Tennis', emoji: '🎾' },
+  { id: 'athletics', name: 'Running', emoji: '🏃' }, { id: 'chess', name: 'Chess', emoji: '♟️' },
+];
 const slots = ['weekday_morning', 'weekday_evening', 'weekday_afternoon', 'friday_night', 'saturday_morning', 'sunday_morning', 'weekend_morning', 'weekend_evening'];
 const slotLabel = (s) => ({ weekday_morning: 'Weekday AM', weekday_evening: 'Weekday PM', weekday_afternoon: 'Weekday noon', friday_night: 'Friday night', saturday_morning: 'Sat AM', sunday_morning: 'Sun AM', weekend_morning: 'Weekend AM', weekend_evening: 'Weekend PM' }[s] || s);
 const skillLabel = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '—');
@@ -22,8 +28,11 @@ export default function Onboarding({ mode = 'full' }) {
   const [saved, setSaved] = useState(false);
   const [joinOpen, setJoinOpen] = useState(false);
   const [editSport, setEditSport] = useState(null);
+  const [primarySport, setPrimarySport] = useState('football');
+  const [personalBio, setPersonalBio] = useState('');
+  const [saveErr, setSaveErr] = useState('');
   const { coords, request, error: geoError, fetching: geoFetching } = useGeolocation();
-  const { user } = useAuth();
+  const { user, profile, updateProfile } = useAuth();
   const navigate = useNavigate();
 
   const examples = [
@@ -47,26 +56,41 @@ export default function Onboarding({ mode = 'full' }) {
 
   const save = async () => {
     if (!parsed) return;
-    const primarySport = parsed.sports?.[0]?.sport || 'football';
+    const chosenPrimary = primarySport || parsed.sports?.[0]?.sport || 'football';
+    // Merge the user-selected primary sport into the sports list so the AI parser
+    // output + manual selection are combined for better matching.
+    let sports = (parsed.sports || []).slice();
+    if (!sports.some((s) => (s.sport || '').toLowerCase() === chosenPrimary.toLowerCase())) {
+      sports = [{ sport: chosenPrimary, skill_level: parsed.skill_level || 'intermediate', role: null, metrics: {} }, ...sports];
+    }
     const payload = {
-      name: user?.profile?.name || user?.user?.display_name || 'Athlete',
+      name: profile?.name || user?.display_name || 'Athlete',
       neighborhood: parsed.location?.neighborhood || '',
       city: parsed.location?.city || 'Hyderabad',
       // Browser geolocation pinpoints you on the map; fall back to Hyderabad.
       lat: coords?.lat ?? 17.4401,
       lng: coords?.lng ?? 78.3489,
-      primary_sport: primarySport,
+      primary_sport: chosenPrimary,
       skill_level: parsed.skill_level || parsed.sports?.[0]?.skill_level || 'intermediate',
       role: parsed.sports?.[0]?.role || '',
-      bio: parsed.summary || text,
+      bio: personalBio || parsed.summary || text,
       availability: parsed.availability || [],
-      sports: parsed.sports || [{ sport: primarySport, skill_level: 'intermediate', role: null, metrics: {} }],
+      sports,
     };
+    setSaveErr('');
     try {
-      await api.createProfile(payload);
+      const res = await api.createProfile(payload);
+      if (res?.data) updateProfile(res.data);
       setSaved(true);
       setTimeout(() => navigate('/app'), 900);
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      setSaveErr(e?.message || 'Could not save. Try again, or continue to the app.');
+    }
+  };
+
+  const continueAnyway = () => {
+    // Always let the user reach the app even if AI parsing wasn't completed.
+    navigate('/app');
   };
 
   const startOver = () => { setState('idle'); setParsed(null); setText(''); };
@@ -77,7 +101,7 @@ export default function Onboarding({ mode = 'full' }) {
         <div className="max-w-md w-full bg-white rounded-3xl border border-line shadow-card p-8 text-center">
           <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-ink text-volt mx-auto"><Users className="w-7 h-7" /></div>
           <h1 className="mt-4 font-display font-bold text-2xl text-ink">Sign in to continue</h1>
-          <p className="mt-2 text-ink-soft">Create a profile or jump in as a demo player to explore SportSphere.</p>
+          <p className="mt-2 text-ink-soft">Create a profile or jump in as a demo player to explore Sparq.</p>
           <div className="mt-6">
             <Button variant="volt" className="w-full" onClick={() => setJoinOpen(true)}>Get started</Button>
             <Link to="/" className="mt-4 block text-sm text-ink-faint hover:text-ink">Back to home</Link>
@@ -181,6 +205,20 @@ export default function Onboarding({ mode = 'full' }) {
                 </div>
               </div>
 
+              {/* personalization: choose primary sport + add more */}
+              <div className="mt-4 rounded-2xl border border-line bg-paper p-4">
+                <p className="text-xs text-ink-faint mb-2">Primary sport — this drives your AI matches</p>
+                <div className="grid grid-cols-4 gap-2">
+                  {ALL_SPORTS.map((s) => (
+                    <button key={s.id} onClick={() => setPrimarySport(s.id)} className={`flex flex-col items-center gap-0.5 rounded-xl border px-1 py-2 text-xs font-semibold transition-all ${primarySport === s.id ? 'bg-pitch text-paper border-pitch shadow-card' : 'bg-white text-ink-soft border-line hover:border-pitch/40'}`}>
+                      <span className="text-xl">{s.emoji}</span>{s.name}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-3 text-xs text-ink-faint">Tell us a bit about yourself (AI uses this to match you)</p>
+                <textarea value={personalBio} onChange={(e) => setPersonalBio(e.target.value)} rows={2} placeholder="e.g. Play football on weekends, intermediate. Also open to cricket." className="mt-1.5 w-full resize-none rounded-xl border border-line bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-volt" />
+              </div>
+
               {/* location + summary */}
               <div className="mt-4 rounded-2xl border border-line bg-paper p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -198,12 +236,23 @@ export default function Onboarding({ mode = 'full' }) {
                 <p className="mt-2 text-sm text-ink-soft">“{parsed.summary}”</p>
               </div>
 
+              {saveErr && (
+                <div className="mt-4 rounded-xl bg-ember/10 border border-ember/30 p-3">
+                  <p className="text-sm text-ember-dark">{saveErr}</p>
+                  <button onClick={continueAnyway} className="mt-1 text-sm font-semibold text-pitch underline underline-offset-2">Continue to app anyway →</button>
+                </div>
+              )}
               <div className="mt-6 flex items-center gap-3">
                 <Button variant="volt" className="flex-1" onClick={save} disabled={saved}>
                   {saved ? <><CheckCircle2 className="w-4 h-4" /> Saved</> : <><Save className="w-4 h-4" /> Save & go to app</>}
                 </Button>
                 <button onClick={startOver} className="inline-flex items-center gap-2 text-sm text-ink-soft hover:text-ink"><RefreshCw className="w-4 h-4" /> Redo</button>
               </div>
+              {!saved && (
+                <p className="mt-3 text-center text-xs text-ink-faint">
+                  Skip AI for now — <button onClick={continueAnyway} className="text-pitch font-semibold underline underline-offset-2">continue to the app</button>
+                </p>
+              )}
             </div>
           </motion.div>
         )}

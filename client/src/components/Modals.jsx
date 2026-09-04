@@ -31,11 +31,18 @@ export function JoinModal({ open, onClose, onToast }) {
     e.preventDefault();
     setErr(''); setLoading(true);
     try {
-      if (mode === 'signup') await register(form.email, form.password, form.displayName || 'Player');
-      else await login(form.email, form.password);
-      onToast(`Welcome ${form.displayName || 'athlete'}! Let's build your profile.`);
-      onClose();
-      navigate('/app');
+      if (mode === 'signup') {
+        await register(form.email, form.password, form.displayName || 'Player');
+        // New account → complete personalization first.
+        onToast('Account created! Let\'s personalize your profile.');
+        onClose();
+        navigate('/onboarding');
+      } else {
+        await login(form.email, form.password);
+        onToast(`Welcome back, ${form.displayName || 'athlete'}!`);
+        onClose();
+        navigate('/app');
+      }
     } catch (e2) {
       setErr(e2.message || 'Something went wrong');
     } finally {
@@ -59,7 +66,7 @@ export function JoinModal({ open, onClose, onToast }) {
               <div className="flex items-center gap-2">
                 <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-volt text-volt-ink"><Sparkles className="w-5 h-5" /></div>
                 <div>
-                  <p className="font-display font-bold text-lg leading-tight">Join SportSphere</p>
+                  <p className="font-display font-bold text-lg leading-tight">Join Sparq</p>
                   <p className="text-white/60 text-xs">AI-powered athlete network</p>
                 </div>
               </div>

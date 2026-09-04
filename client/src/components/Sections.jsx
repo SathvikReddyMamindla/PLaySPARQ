@@ -267,7 +267,7 @@ export function FinalCTA({ onOpenJoinModal }) {
             Ready to find <span className="text-volt">your people</span>?
           </h2>
           <p className="mt-5 max-w-xl mx-auto text-white/70 text-lg">
-            Describe how you play in one sentence and watch SportSphere build your profile, rank your
+            Describe how you play in one sentence and watch Sparq build your profile, rank your
             matches, and explain why each one fits.
           </p>
           <div className="mt-8 flex flex-wrap items-center justify-center gap-4">
@@ -288,10 +288,12 @@ export function Footer() {
         <div className="md:col-span-2">
           <div className="flex items-center gap-2.5">
             <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-ink text-volt"><Activity className="w-5 h-5" /></div>
-            <span className="font-display font-bold text-xl text-ink">Sport<span className="text-pitch">Sphere</span></span>
+            <span className="font-display font-bold text-xl text-ink">Spar<span className="text-ember">q</span></span>
           </div>
           <p className="mt-3 max-w-sm text-sm text-ink-soft">The AI-powered multi-sport athlete discovery platform. Every sport. Every athlete. One community.</p>
-          <p className="mt-4 text-xs text-ink-faint">Built on the PLAYSync architecture · AI inference via Featherless.</p>
+          <p className="mt-4 text-xs font-semibold text-pitch inline-flex items-center gap-1.5 bg-volt/25 px-2.5 py-1 rounded-lg">
+            <Sparkles className="w-3.5 h-3.5" /> Powered By featherless.ai
+          </p>
         </div>
         <div>
           <h4 className="eyebrow text-pitch">Product</h4>
@@ -307,12 +309,15 @@ export function Footer() {
           <ul className="mt-3 space-y-2 text-sm text-ink-soft">
             <li>Hyderabad · India</li>
             <li>Cricket, Football, Badminton…</li>
-            <li>Powered by Featherless AI</li>
+            <li><a href="https://featherless.ai" target="_blank" rel="noreferrer" className="hover:text-ink font-semibold text-pitch inline-flex items-center gap-1"><Sparkles className="w-3 h-3" /> Powered By featherless.ai</a></li>
           </ul>
         </div>
       </div>
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-10 pt-6 border-t border-line flex flex-col sm:flex-row items-center justify-between gap-3">
-        <p className="text-xs text-ink-faint">© {new Date().getFullYear()} SportSphere. Hackathon MVP.</p>
+        <p className="text-xs text-ink-faint">© {new Date().getFullYear()} Sparq. Hackathon MVP.</p>
+        <p className="text-xs font-semibold text-pitch inline-flex items-center gap-1.5">
+          <Sparkles className="w-3.5 h-3.5" /> Powered By featherless.ai
+        </p>
         <p className="text-xs text-ink-faint">Made with <span className="text-ember">♥</span> for athletes.</p>
       </div>
     </footer>

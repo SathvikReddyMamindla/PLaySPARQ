@@ -4,6 +4,7 @@ const variants = {
   primary: 'bg-ink text-paper hover:bg-pitch shadow-card',
   volt: 'bg-volt text-volt-ink hover:bg-volt-soft shadow-volt',
   ember: 'bg-ember text-white hover:bg-ember-dark shadow-ember',
+  pitch: 'bg-pitch text-paper hover:bg-pitch-dark shadow-card',
   outline: 'border border-ink/20 bg-transparent text-ink hover:border-ink/50 hover:bg-white/60',
   ghost: 'text-ink-soft hover:bg-ink/5 hover:text-ink',
 };

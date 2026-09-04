@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Search, MapPin, Loader2, Sparkles, UserPlus, Check, Star, Clock, LayoutGrid, Map as MapIcon, LocateFixed } from 'lucide-react';
+import { Search, MapPin, Loader2, Sparkles, UserPlus, Check, Star, Clock, LayoutGrid, Map as MapIcon, LocateFixed, MessageSquare } from 'lucide-react';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import AthleteMap from '../components/AthleteMap';
@@ -13,7 +13,6 @@ const sportEmoji = { football: '⚽', cricket: '🏏', badminton: '🏸', basket
 const sports = ['all', 'football', 'cricket', 'badminton', 'basketball', 'swimming', 'tennis', 'athletics', 'chess'];
 
 export default function DiscoverPage() {
-  const navigate = useNavigate();
   const { profile } = useAuth();
   const [sport, setSport] = useState('all');
   const [skill, setSkill] = useState('all');
@@ -24,7 +23,9 @@ export default function DiscoverPage() {
   const [meta, setMeta] = useState({});
   const [sent, setSent] = useState({});
   const [view, setView] = useState('list'); // list | map
+  const [connections, setConnections] = useState([]); // accepted friends (for map)
   const { coords, request, error: geoError } = useGeolocation();
+  const navigate = useNavigate();
 
   const load = useCallback(async (over = {}) => {
     setLoading(true);
@@ -32,20 +33,56 @@ export default function DiscoverPage() {
       const res = await api.players({
         lat: 17.4401, lng: 78.3489, radiusKm: over.radius ?? radius,
         sportId: over.sport ?? sport, skillLevel: over.skill ?? skill, search: over.search ?? search,
-        limit: 30, profile_id: profile?.id || 'ath-current-user',
+        limit: 30, profile_id: profile?.id || '',
       });
-      setPlayers(res?.data?.players || []);
+      const raw = res?.data?.players || [];
+      const seen = new Set();
+      const unique = raw.filter((pl) => {
+        if (!pl?.id || seen.has(pl.id)) return false;
+        seen.add(pl.id);
+        return true;
+      });
+      setPlayers(unique);
       setMeta(res?.data?.meta || {});
+      // Track who we're already connected to so buttons/map reflect friendship.
+      const conn = await api.friends();
+      setConnections(conn || []);
     } catch (e) { console.error(e); } finally { setLoading(false); }
   }, [radius, sport, skill, search, profile]);
 
   useEffect(() => { load(); }, [load]);
 
+  // Background poll friends so when another device connects or accepts, buttons/map update
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const conn = await api.friends();
+        if (conn) setConnections(conn);
+      } catch (e) {}
+    }, 4000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const connectedIds = new Set(connections.map((c) => c.id));
+  const friendsMap = new Map(connections.map((c) => [c.id, c]));
+
+
   const connect = async (p) => {
     try {
-      const res = await api.sendConnection({ recipientId: p.id, sportId: p.matched_sport || 'football', type: 'match_invite', message: `Hey ${p.name.split(' ')[0]}, would love to match up!` });
-      if (res?.success) setSent((s) => ({ ...s, [p.id]: true }));
-    } catch (e) { /* if not authed, prompt */ }
+      const res = await api.sendConnection({
+        recipientId: p.id,
+        sportId: p.matched_sport || 'football',
+        type: 'match_invite',
+        message: `Hey ${p.name.split(' ')[0]}, would love to match up!`,
+      });
+      if (res?.success) {
+        setSent((s) => ({ ...s, [p.id]: true }));
+        const conn = await api.friends();
+        setConnections(conn || []);
+      }
+    } catch (e) {
+      console.error('Connect failed:', e);
+    }
   };
 
   return (
@@ -55,7 +92,9 @@ export default function DiscoverPage() {
           <h1 className="font-display font-bold text-2xl md:text-3xl text-ink">Discover athletes</h1>
           <p className="text-sm text-ink-soft mt-1">Ranked by the compatibility engine, explained by AI.</p>
         </div>
-        <Badge tone={meta.ai_enabled ? 'volt' : 'neutral'}>{meta.ai_enabled ? <><Sparkles className="w-3 h-3" /> AI narration</> : 'Heuristic ranking'}</Badge>
+        <Badge tone={meta.ai_enabled ? 'volt' : 'neutral'}>
+          {meta.ai_enabled ? <><Sparkles className="w-3 h-3" /> AI narration · Powered By featherless.ai</> : 'Heuristic ranking'}
+        </Badge>
       </div>
 
       {/* filters */}
@@ -106,34 +145,40 @@ export default function DiscoverPage() {
 
       {view === 'map' ? (
         <div className="relative">
-          <div className="absolute top-3 right-3 z-[500]">
+          <div className="absolute top-3 right-3 z-[500] flex flex-col items-end gap-2">
             <button onClick={request} className="inline-flex items-center gap-2 rounded-xl bg-white border border-line px-3 py-2 text-sm font-medium shadow-card hover:border-ink/30">
               <LocateFixed className="w-4 h-4 text-pitch" /> Center on me
             </button>
-            {geoError && <p className="mt-1 text-[11px] text-ember bg-white/90 rounded px-2 py-1">{geoError}</p>}
+            {geoError && <p className="text-[11px] text-ember bg-white/90 rounded px-2 py-1">{geoError}</p>}
+            {connections.length > 0 && (
+              <p className="text-[11px] text-ink-soft bg-white/90 rounded px-2 py-1">● Showing your {connections.length} connected {connections.length === 1 ? 'friend' : 'friends'} — tap a pin to view & chat</p>
+            )}
           </div>
           <AthleteMap
-            athletes={players}
+            athletes={connections.length ? connections.map((f) => ({ ...f, matched_sport: f.sport, compatibilityScore: null, reliability_rate: null })) : players}
             center={{ lat: 17.4401, lng: 78.3489 }}
             focus={coords || null}
             height="520px"
-            connectedIds={new Set(Object.keys(sent))}
-            onConnect={(p) => connect(p)}
+            connectedIds={connectedIds}
+            onConnect={(p) => {
+              if (connectedIds.has(p.id)) {
+                const friend = friendsMap.get(p.id);
+                navigate(friend?.conversation_id ? `/app/chat/${friend.conversation_id}` : '/app/chat');
+              } else {
+                connect(p);
+              }
+            }}
           />
         </div>
       ) : (
       <div className="grid md:grid-cols-2 gap-5">
         {players.map((p) => (
           <article key={p.id} className="rounded-2xl border border-line bg-white p-5 shadow-card hover-lift volt-glow">
-            <div
-              className="flex items-start gap-3 cursor-pointer group"
-              onClick={() => navigate(`/app/profile/${p.id}`)}
-              title="Click to view full athlete profile"
-            >
-              <img src={p.avatar} alt={p.name} className="w-16 h-16 rounded-2xl object-cover group-hover:opacity-90 transition-opacity" />
+            <div className="flex items-start gap-3">
+              <img src={p.avatar} alt={p.name} className="w-16 h-16 rounded-2xl object-cover" />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between">
-                  <h3 className="font-display font-bold text-lg text-ink truncate group-hover:text-pitch transition-colors">{p.name}</h3>
+                  <h3 className="font-display font-bold text-lg text-ink truncate">{p.name}</h3>
                   <div className="text-center shrink-0">
                     <div className="font-display font-bold text-2xl text-ember">{p.compatibilityScore}</div>
                     <div className="text-[10px] text-ink-faint">match</div>
@@ -160,17 +205,22 @@ export default function DiscoverPage() {
               <div className="flex items-center gap-2 text-xs text-ink-soft">
                 <Star className="w-3.5 h-3.5 text-ember" /> {p.rating} · <Clock className="w-3.5 h-3.5" /> {p.reliability_rate ?? p.reliabilityRate ?? '—'}% reliable
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => navigate(`/app/profile/${p.id}`)}
-                  className="text-xs font-semibold text-pitch hover:underline px-2 py-1"
+              {connectedIds.has(p.id) || sent[p.id] ? (
+                <Button
+                  variant="pitch"
+                  size="sm"
+                  onClick={() => {
+                    const friend = friendsMap.get(p.id);
+                    navigate(friend?.conversation_id ? `/app/chat/${friend.conversation_id}` : '/app/chat');
+                  }}
                 >
-                  View Profile
-                </button>
-                <Button variant={sent[p.id] ? 'ghost' : 'volt'} size="sm" onClick={() => connect(p)} disabled={sent[p.id]}>
-                  {sent[p.id] ? <><Check className="w-4 h-4" /> Sent</> : <><UserPlus className="w-4 h-4" /> Connect</>}
+                  <MessageSquare className="w-4 h-4" /> {connectedIds.has(p.id) ? 'Chat' : 'Friend'}
                 </Button>
-              </div>
+              ) : (
+                <Button variant="volt" size="sm" onClick={() => connect(p)}>
+                  <UserPlus className="w-4 h-4" /> Connect
+                </Button>
+              )}
             </div>
           </article>
         ))}

@@ -105,7 +105,6 @@ export default function AthleteMap({
            </div>
            <p class="ath-pop__bio">${a.explanation || a.bio || ''}</p>
            ${buttonHtml}
-           <a href="/app/profile/${a.id}" style="display:block; text-align:center; font-size:11px; font-weight:600; color:#123B33; text-decoration:underline; margin-top:8px;">View Full Profile</a>
          </div>`,
         { minWidth: 230 }
       );

@@ -15,15 +15,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
-from dotenv import load_dotenv
-
-# Ensure server/.env is loaded
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-if _env_path.exists():
-    load_dotenv(dotenv_path=_env_path)
-else:
-    load_dotenv()
 
 MODEL = os.getenv("FEATHERLESS_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 API_BASE = os.getenv("FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1")
@@ -40,8 +31,7 @@ def get_client():
         return None
     try:
         from openai import OpenAI
-        base_url = os.getenv("FEATHERLESS_BASE_URL", API_BASE)
-        _client = OpenAI(api_key=api_key, base_url=base_url)
+        _client = OpenAI(api_key=api_key, base_url=API_BASE)
         return _client
     except Exception as e:  # pragma: no cover
         print("[ai] client init failed:", e)
@@ -89,8 +79,8 @@ def _extract_json(raw):
         return json.loads(raw)
     except Exception:
         pass
-    # Try to pull the first balanced JSON object out of prose.
-    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    # Try to pull the first balanced JSON object or array out of prose.
+    m = re.search(r"(\{.*\}|\[.*\])", raw, flags=re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
@@ -108,8 +98,24 @@ plays into a structured profile. Normalize every sport onto a common 5-level ski
 FIDE 700-1000 -> beginner, 1000-1400 -> intermediate, 1400-1800 -> advanced, 1800+ -> pro;
 cricket "club/district level" -> advanced, "municipal/college" -> intermediate,
 "just for fun" -> beginner; 5K time 35+ min -> beginner, 28-35 -> intermediate,
-23-28 -> advanced, sub-23 -> pro. Respond with ONLY valid JSON matching the schema, no prose,
-no markdown."""
+23-28 -> advanced, sub-23 -> pro.
+
+Respond with ONLY valid JSON strictly following this schema:
+{
+  "primary_sport": "string (e.g. badminton, football, cricket, chess, tennis, running, swimming, basketball)",
+  "sports": [
+    {
+      "sport": "string",
+      "skill_level": "beginner|intermediate|advanced|pro|elite",
+      "role": "string or null",
+      "metrics": {}
+    }
+  ],
+  "availability": ["array of slots e.g. weekday_morning, weekday_evening, weekend_morning, weekend_evening"],
+  "location": {"city": "string", "neighborhood": "string"},
+  "skill_tags": ["array of tags"],
+  "summary": "1-2 sentence athlete summary"
+}"""
 
 
 def _parse_profile(raw_text: str) -> dict | None:
@@ -125,31 +131,57 @@ def _parse_profile(raw_text: str) -> dict | None:
 
 def _clean_parse(data: dict, raw_text: str):
     # Normalize schema keys regardless of what the model returns.
+    raw_sports = data.get("sports")
+    if not raw_sports and (data.get("sport") or data.get("primary_sport")):
+        raw_sports = [{
+            "sport": data.get("sport") or data.get("primary_sport"),
+            "skill_level": data.get("skill_level") or data.get("level") or "intermediate",
+            "role": data.get("role"),
+            "metrics": data.get("metrics") or {},
+        }]
+
     sports = []
-    for s in data.get("sports", []) or []:
+    for s in (raw_sports or []):
         if isinstance(s, dict):
-            level = str(s.get("skill_level", s.get("skillLevel", "intermediate"))).lower()
+            level = str(s.get("skill_level", s.get("skillLevel", s.get("level", "intermediate")))).lower()
             sports.append({
-                "sport": s.get("sport", s.get("name", "")),
+                "sport": str(s.get("sport", s.get("name", ""))).lower().replace(" & running", "").replace(" and running", ""),
                 "skill_level": level if level in SKILLS else "intermediate",
                 "role": s.get("role"),
                 "metrics": s.get("metrics") or {},
             })
-    primary = data.get("primary_sport", "").replace(" & Running", "").replace(" and Running", "").strip()
-    if not primary and sports:
-        primary = sports[0]["sport"]
-    if not primary:
-        primary = _detect_sport(raw_text)
+
+    # If sports is still empty, fall back to heuristic sport detection
+    if not sports:
+        det_sport = _detect_sport(raw_text)
+        det_skill = _detect_skill_level(raw_text, det_sport)
+        sports.append({"sport": det_sport, "skill_level": det_skill, "role": None, "metrics": {}})
+
+    primary = data.get("primary_sport") or (sports[0]["sport"] if sports else "football")
+    primary = str(primary).lower().replace(" & running", "").replace(" and running", "")
+
+    loc = data.get("location")
+    if isinstance(loc, str):
+        loc = {"city": "Hyderabad", "neighborhood": loc}
+    elif not isinstance(loc, dict) or not loc.get("neighborhood"):
+        h_loc = _heuristic_parse(raw_text).get("location") or {}
+        loc = {"city": (loc.get("city") if isinstance(loc, dict) else None) or h_loc.get("city", "Hyderabad"),
+               "neighborhood": (loc.get("neighborhood") if isinstance(loc, dict) else None) or h_loc.get("neighborhood", "")}
+
+    avail = data.get("availability") or []
+    if not avail or not isinstance(avail, list):
+        avail = _heuristic_parse(raw_text).get("availability", ["weekday_evening", "weekend_morning"])
+
     return {
         "sports": sports,
         "primary_sport": primary,
         "skill_level": (sports[0]["skill_level"] if sports else "intermediate"),
-        "availability": data.get("availability", []),
-        "location": data.get("location") or {},
-        "skill_tags": data.get("skill_tags", []),
+        "availability": avail,
+        "location": loc,
+        "skill_tags": data.get("skill_tags") or [sports[0]["skill_level"] if sports else "intermediate"],
         "summary": data.get("summary") or raw_text[:160],
         "is_spammy": bool(data.get("is_spammy", False)),
-        "trust_signals": data.get("trust_signals") or {},
+        "trust_signals": data.get("trust_signals") or {"score": 85, "reasons": ["AI validated profile"]},
     }
 
 
@@ -279,10 +311,13 @@ def _heuristic_parse(raw_text: str) -> dict:
 MATCH_SYSTEM = """You are a matchmaker for athletes. You receive a requester profile and a list of
 candidate athlete profiles, each with a precomputed compatibility score (0-100) and a numeric
 breakdown of proximityScore, skillCalibrationScore, roleSynergyScore, scheduleOverlapScore,
-trustScore. For each candidate, write: a "match_tier" (one of "Perfect Match"/"High Synergy"/
-"Good Fit"/"Possible Fit"), a "one_liner" <= 18 words that names the top 2-3 concrete reasons a
-human can verify, and 2-4 short "reason_tags". Tone: friendly, specific, encouraging. Respond
-with ONLY JSON, no prose."""
+trustScore. For each candidate, produce an item with:
+- "athlete_id": the candidate's athlete_id
+- "match_tier": one of "Perfect Match", "High Synergy", "Good Fit", "Possible Fit"
+- "one_liner": <= 18 words that names the top 2-3 concrete reasons a human can verify
+- "reason_tags": 2-4 short tags
+Tone: friendly, specific, encouraging.
+Respond with ONLY valid JSON: {"ranked": [{"athlete_id": "...", "match_tier": "...", "one_liner": "...", "reason_tags": [...]}]}"""
 
 
 def match_explanations(requester: dict, candidates: list[dict]) -> list[dict]:
@@ -292,9 +327,28 @@ def match_explanations(requester: dict, candidates: list[dict]) -> list[dict]:
         "candidates": [_compact_candidate(c) for c in candidates],
     }
     result = _chat_json(MATCH_SYSTEM, json.dumps(payload), temperature=0.7, max_tokens=900)
-    if result and isinstance(result.get("ranked"), list):
-        return [_normalize_expl(e, c["athlete_id"]) for e, c in
-                zip(result["ranked"], candidates)]
+    raw_items = None
+    if isinstance(result, list):
+        raw_items = result
+    elif isinstance(result, dict):
+        for k in ["ranked", "candidates", "explanations", "matches", "results"]:
+            if isinstance(result.get(k), list):
+                raw_items = result[k]
+                break
+
+    if raw_items:
+        # Match back by athlete_id if possible, else positional zip
+        by_id = {item.get("athlete_id"): item for item in raw_items if isinstance(item, dict) and item.get("athlete_id")}
+        out = []
+        for i, c in enumerate(candidates):
+            cid = c["athlete_id"]
+            e = by_id.get(cid) or (raw_items[i] if i < len(raw_items) and isinstance(raw_items[i], dict) else None)
+            if e:
+                out.append(_normalize_expl(e, cid))
+            else:
+                out.append(_heuristic_explanation(c))
+        return out
+
     # Heuristic narration fallback.
     out = []
     for c in candidates:
@@ -363,7 +417,16 @@ def _heuristic_explanation(c: dict) -> dict:
 # ---------------------------------------------------------------------------
 TRUST_SYSTEM = """You assess athlete profile text for trust and spam. Look for copy-paste/duplicated
 bios, promotional or "gaming" language, internally contradictory claims (e.g. "beginner" plus
-"national champion"), missing specifics, or suspicious contact/URL patterns. Respond with ONLY JSON."""
+"national champion"), missing specifics, or suspicious contact/URL patterns.
+
+Respond with ONLY valid JSON following this schema:
+{
+  "score": 85,
+  "risk_level": "low",
+  "flags": [],
+  "note": "Specific, authentic bio with no spam detected.",
+  "action": "ok"
+}"""
 
 
 def trust_note(profile: dict) -> dict:

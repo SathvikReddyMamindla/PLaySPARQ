@@ -33,10 +33,10 @@ export default function Navbar({ onOpenJoinModal }) {
             </div>
             <div className="flex flex-col">
               <span className="font-display font-bold text-xl tracking-tight text-ink">
-                Sport<span className="text-pitch">Sphere</span>
+                Spar<span className="text-ember">q</span>
               </span>
               <span className="text-[10px] text-ink-faint font-medium tracking-widest uppercase -mt-1">
-                AI Athlete Network
+                Find your game
               </span>
             </div>
           </a>

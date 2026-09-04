@@ -48,12 +48,10 @@ export const api = {
   trustNote: (payload) => request('/ai/trust-note', { method: 'POST', body: payload }),
   performanceSummary: (sportId, profileId) => request('/ai/performance-summary', { method: 'POST', body: { sportId, profileId } }),
 
-  // profiles & privacy
+  // profiles
   athletes: () => request('/athletes'),
   athlete: (id) => request(`/athletes/${id}`),
   createProfile: (d) => request('/athletes', { method: 'POST', body: d }),
-  updateProfile: (id, d) => request(`/athletes/${id}`, { method: 'PUT', body: d }),
-  updatePrivacy: (id, d) => request(`/athletes/${id}/privacy`, { method: 'PUT', body: d }),
 
   // discovery
   players: (params) => request('/discovery/players', { params }),
@@ -65,68 +63,36 @@ export const api = {
   sendConnection: (d) => request('/connections/request', { method: 'POST', body: d }),
   connectionStatus: (recipientId) => request(`/connections/status/${recipientId}`),
   respondConnection: (connectionId, accept) => request('/connections/respond', { method: 'POST', body: { connectionId, accept } }),
+  friends: async () => {
+    const r = await request('/connections');
+    return r?.data?.friends || [];
+  },
 
-  // chat & safety
+  // chat
   conversations: () => request('/chat/conversations'),
   messages: (cid) => request(`/chat/conversations/${cid}/messages`),
   sendMessage: (cid, body) => request(`/chat/conversations/${cid}/messages`, { method: 'POST', body: { body } }),
-  markRead: (cid) => request(`/chat/conversations/${cid}/read`, { method: 'POST' }),
-  blockUser: (userId) => request(`/users/${userId}/block`, { method: 'POST' }),
-  unblockUser: (userId) => request(`/users/${userId}/unblock`, { method: 'POST' }),
-  blockedUsers: () => request('/users/blocked'),
-  reportUser: (userId, reason, details = '', targetId = null) =>
-    request(`/users/${userId}/report`, { method: 'POST', body: { reportedId: userId, reason, details, targetId } }),
-  reportMessage: (messageId, reportedId, reason, details = '') =>
-    request(`/chat/messages/${messageId}/report`, { method: 'POST', body: { reportedId, reason, details, targetId: messageId } }),
+  markConversationRead: (cid) => request(`/chat/conversations/${cid}/read`, { method: 'POST' }),
 
-  // personalization & recommendations
-  personalizedHome: () => request('/personalization/home'),
-  recommendedPlayers: () => request('/recommendations/players'),
-  recommendedTournaments: () => request('/recommendations/tournaments'),
-
-  // tournaments
-  tournaments: (sportId) => request('/tournaments', { params: sportId ? { sport_id: sportId } : undefined }),
-  tournament: (id) => request(`/tournaments/${id}`),
-  directRegister: (id, teamName = '') => request(`/tournaments/${id}/register`, { method: 'POST', body: { tournamentId: id, teamName } }),
-
-  // payments & checkout
-  createPaymentOrder: (tournamentId, discountCode = '', teamName = '') =>
-    request('/payments/create-order', { method: 'POST', body: { tournamentId, discountCode: discountCode || null, teamName } }),
-  verifyPayment: (orderId, paymentId, signature, tournamentId, teamName = '') =>
-    request('/payments/verify', { method: 'POST', body: { orderId, paymentId, signature, tournamentId, teamName } }),
-  receipt: (paymentId) => request(`/payments/receipt/${paymentId}`),
-
-  // discounts
-  validateDiscount: (code, tournamentId) => request('/discounts/validate', { method: 'POST', body: { code, tournamentId } }),
-  availableDiscounts: () => request('/discounts/available'),
+  // community
+  communityPosts: () => request('/community/posts'),
+  createCommunityPost: (d) => request('/community/posts', { method: 'POST', body: d }),
+  likeCommunityPost: (pid) => request(`/community/posts/${pid}/like`, { method: 'POST' }),
 
   // notifications
-  notifications: (category) => request('/notifications', { params: category ? { category } : undefined }),
-  markNotificationRead: (id) => request(`/notifications/${id}/read`, { method: 'PATCH' }),
-  markAllNotificationsRead: () => request('/notifications/mark-all-read', { method: 'POST' }),
-  notificationPreferences: () => request('/notifications/preferences'),
-  updateNotificationPreferences: (d) => request('/notifications/preferences', { method: 'PUT', body: d }),
-
-  // admin
-  adminCreateTournament: (d) => request('/admin/tournaments', { method: 'POST', body: d }),
-  adminUpdateTournament: (id, d) => request(`/admin/tournaments/${id}`, { method: 'PUT', body: d }),
-  adminRegistrations: () => request('/admin/registrations'),
-  adminCreateDiscount: (d) => request('/admin/discounts', { method: 'POST', body: d }),
-  adminToggleDiscount: (id) => request(`/admin/discounts/${id}/toggle`, { method: 'PATCH' }),
-  adminPayments: () => request('/admin/payments'),
-  adminRefund: (paymentId, reason = '') => request(`/admin/payments/${paymentId}/refund`, { method: 'POST', body: { paymentId, reason } }),
-  adminAnnouncement: (d) => request('/admin/announcements', { method: 'POST', body: d }),
-  adminReports: (status) => request('/admin/reports', { params: status ? { status } : undefined }),
-  adminResolveReport: (id) => request(`/admin/reports/${id}/resolve`, { method: 'POST' }),
+  notifications: () => request('/notifications'),
 
   // events
   allEvents: () => request('/events'),
   createEvent: (d) => request('/events', { method: 'POST', body: d }),
   joinEvent: (id) => request(`/events/${id}/join`, { method: 'POST' }),
+  payJoinEvent: (id) => request(`/events/${id}/pay`, { method: 'POST' }),
   leaveEvent: (id) => request(`/events/${id}/leave`, { method: 'POST' }),
+  myEvents: () => request('/me/events'),
 
   // sports
   sports: () => request('/sports'),
 };
 
+// Trim a string to a number or null.
 export const num = (v, fallback = 0) => (isNaN(parseFloat(v)) ? fallback : parseFloat(v));

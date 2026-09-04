@@ -3,10 +3,11 @@ __pycache__/
 *.py[cod]
 .venv/
 server/.env
-.env
+
+# SQLite database (persisted user data)
 *.db
-*.db-wal
 *.db-shm
+*.db-wal
 
 # Node
 node_modules/
